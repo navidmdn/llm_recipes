@@ -1,0 +1,26 @@
+
+WANDB_MODE=online WANDB_ENTITY=<your user name> WANDB_PROJECT=<your project name> python llama3_qlora_sft_completion_only.py\
+  --train_file data/train.json\
+  --dev_dir data/\
+  --output_dir outputs/llama3_qlora_test\
+  --do_train\
+  --do_eval\
+  --model_id meta-llama/Meta-Llama-3-8B-Instruct\
+  --use_peft\
+  --load_in_4bit\
+  --include_inputs_for_metrics\
+  --per_device_train_batch_size 4\
+  --per_device_eval_batch_size 4\
+  --gradient_accumulation_steps 8\
+  --num_train_epochs 10\
+  --save_strategy steps\
+  --eval_strategy steps\
+  --save_total_limit 1\
+  --metric_for_best_model "eval_set1_val_loss"\
+  --save_steps 5\
+  --logging_steps 1\
+  --overwrite_output_dir\
+  --report_to wandb\
+  --load_best_model_at_end\
+  --eval_steps 5\
+  --max_new_tokens 1024

@@ -1,8 +1,10 @@
+import logging
 from dataclasses import dataclass, field
 import os
+import random
 import torch
 from datasets import load_dataset
-from transformers import LlamaForCausalLM, AutoConfig, EarlyStoppingCallback
+from transformers import AutoTokenizer, TrainingArguments, LlamaForCausalLM, AutoConfig, EarlyStoppingCallback
 import numpy as np
 from trl.commands.cli_utils import TrlParser
 from transformers import (
@@ -11,69 +13,16 @@ from transformers import (
     BitsAndBytesConfig,
     set_seed,
 )
+from tqdm import tqdm
 import nltk
 import glob
+from trl import setup_chat_format, DataCollatorForCompletionOnlyLM
 from peft import LoraConfig
 
 from trl import (
     SFTConfig,
     SFTTrainer)
 
-from torch.utils.data import DataLoader
-import evaluate
-from transformers.data.data_collator import DataCollatorMixin
-from transformers import PreTrainedTokenizerBase
-from typing import List, Union, Dict, Any, Optional
-
-
-class Llama3ChatCompletionDataCollator(DataCollatorMixin):
-    def __init__(self, tokenizer: PreTrainedTokenizerBase, return_tensors='pt'):
-        self.tokenizer = tokenizer
-        self.return_tensors = return_tensors
-
-    def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
-        raw_input_ids: List[np.ndarray] = [e['input_ids'] for e in examples]
-        raw_labels: List[np.ndarray] = [e['labels'] for e in examples]
-        max_input_len = max([len(p) for p in raw_input_ids])
-
-        labels = []
-        input_ids = []
-        attention_masks = []
-        for full_input_ids, label_ids in zip(raw_input_ids, raw_labels):
-            pad_len = max_input_len - len(full_input_ids)
-            pad_list = [self.tokenizer.pad_token_id]*pad_len
-            ignore_loss_list = [-100]*pad_len
-
-            label_ids = np.concatenate([label_ids, ignore_loss_list])
-            attention_mask = [1] * len(full_input_ids) + [0] * pad_len
-            full_input_ids = np.concatenate([full_input_ids, pad_list])
-
-            labels.append(label_ids)
-            input_ids.append(full_input_ids)
-            attention_masks.append(attention_mask)
-
-        return {
-            'input_ids': torch.LongTensor(np.array(input_ids)),
-            'labels': torch.LongTensor(np.array(labels)),
-            'attention_mask': torch.LongTensor(np.array(attention_masks))
-        }
-
-
-def print_batch(batch: Dict, tokenizer: PreTrainedTokenizerBase):
-    input_ids_list = batch['input_ids'].numpy()
-    attention_mask_list = batch['attention_mask'].numpy()
-    label_list = batch['labels'].numpy()
-
-    print("_" * 50)
-    for input_ids, attention_mask, label in zip(input_ids_list, attention_mask_list, label_list):
-        non_padded_input_ids = input_ids[attention_mask == 1]
-        non_padded_label = label[attention_mask == 1]
-        print("Input:")
-        print(tokenizer.decode(non_padded_input_ids))
-
-        completion = non_padded_label[non_padded_label != -100]
-        print("Label:")
-        print(tokenizer.decode(completion))
 
 
 @dataclass
@@ -119,6 +68,12 @@ class ScriptArguments:
     )
     eval_temperature: float = field(
         default=0.3, metadata={"help": "Temperature for sampling during evaluation"}
+    )
+    eval_max_samples: int = field(
+        default=None, metadata={"help": "Max number of samples to evaluate from each dev file"}
+    )
+    eval_generation_batch_size: int = field(
+        default=64, metadata={"help": "Batch size for generation during evaluation"}
     )
     eval_top_p: float = field(
         default=0.93, metadata={"help": "Top p for sampling during evaluation"}
@@ -179,69 +134,36 @@ def training_function(script_args, training_args):
                 cache_dir=script_args.cache_dir,
             )
             dev_split_name = dev_file_path.split("/")[-1].split(".")[0]
+            if script_args.eval_max_samples is not None:
+                ds = ds.select(range(script_args.eval_max_samples))
             dev_datasets[dev_split_name] = ds
     else:
         raise NotImplementedError("No dev files provided")
+
+    def add_system_prompt(example):
+        # mistral doesn't support system messages
+        #todo: check for recent versions
+        if 'mistral' not in script_args.model_id.lower():
+            example["messages"].insert(0, {"role": "system", "content": "todo"})
+
+        if example['messages'][0]['role'] == 'assistant':
+            example['messages'] = example['messages'][1:]
+
+        return example
+
+    train_dataset = train_dataset.map(add_system_prompt)
+
+    for k, dev_dataset in dev_datasets.items():
+        dev_datasets[k] = dev_dataset.map(add_system_prompt)
+
 
     ################
     # Model & Tokenizer
     ###############
     tokenizer = AutoTokenizer.from_pretrained(script_args.model_id, use_fast=True, cache_dir=script_args.cache_dir)
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    tokenizer.pad_token = "<|reserved_special_token_4|>"
-    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
-
-    def preprocess_dataset(example):
-        """
-        Preprocess the dataset to convert it to chat format
-        :param example:
-        :return:
-        """
-        full_chat_formatted = [
-            {"role": "system", "content": "You are a helpful and friendly assistant."},
-            {"role": "user", "content": example['query']},
-            {"role": "assistant", "content": example['response']}
-        ]
-
-        user_prompt_chat_formatted = [
-            {"role": "system", "content": "You are a helpful and friendly assistant."},
-            {"role": "user", "content": example['query']},
-        ]
-
-        full_chat_input_ids = tokenizer.apply_chat_template(
-                full_chat_formatted,
-                add_generation_prompt=False,
-                tokenize=True
-        )
-
-        input_chat_input_ids = tokenizer.apply_chat_template(
-                user_prompt_chat_formatted,
-                add_generation_prompt=True,
-                tokenize=True
-        )
-
-        labels = np.array(full_chat_input_ids)
-        labels[:len(input_chat_input_ids)] = -100
-
-        return {
-            'input_ids': np.array(full_chat_input_ids),
-            'labels': labels,
-        }
-
-    train_dataset = train_dataset.map(preprocess_dataset).remove_columns(["query", "response"])
-    dev_datasets = {k: v.map(preprocess_dataset).remove_columns(["query", "response"]) for k, v in dev_datasets.items()}
-
-    data_collator = Llama3ChatCompletionDataCollator(tokenizer=tokenizer)
-
-    with training_args.main_process_first(
-            desc="Log a few random samples from the collated training set"
-    ):
-        # check the format of collated dataset
-        dl = DataLoader(train_dataset.select(range(2)), batch_size=2, collate_fn=data_collator)
-        batch = next(iter(dl))
-        print_batch(batch, tokenizer)
-
-
+    # Model
     device_map = None
     if 'llama-3' in script_args.model_id.lower() and not script_args.local_test:
         print("Using llama 3 recommended data type")
@@ -254,6 +176,10 @@ def training_function(script_args, training_args):
         quant_storage_dtype = torch.float16
         bnb_4bit_use_double_quant = False
         device_map = {"": 0}
+    elif 'mistral' in script_args.model_id.lower() and not script_args.local_test:
+        torch_dtype = torch.bfloat16
+        quant_storage_dtype = torch.bfloat16
+        bnb_4bit_use_double_quant = None
     else:
         torch_dtype = None
         quant_storage_dtype = None
@@ -274,7 +200,8 @@ def training_function(script_args, training_args):
         model = AutoModelForCausalLM.from_pretrained(
             script_args.model_id,
             quantization_config=quantization_config,
-            attn_implementation="flash_attention_2" if script_args.flash_attention else None,
+            # attn_implementation="flash_attention_2" if script_args.flash_attention else None,
+            use_flash_attention_2=script_args.flash_attention,
             torch_dtype=quant_storage_dtype,
             use_cache=False if training_args.gradient_checkpointing else True,
             cache_dir=script_args.cache_dir,
@@ -291,6 +218,7 @@ def training_function(script_args, training_args):
 
     peft_config = None
     if script_args.use_peft:
+        # LoRA config based on QLoRA paper & Sebastian Raschka experiment
         peft_config = LoraConfig(
             lora_alpha=script_args.lora_alpha,
             lora_dropout=0.05,
@@ -301,100 +229,22 @@ def training_function(script_args, training_args):
             # modules_to_save = ["lm_head", "embed_tokens"] # add if you want to use the Llama 3 instruct template
         )
 
-    metric = evaluate.load("rouge", cache_dir=script_args.cache_dir)
-
-    def compute_metrics(eval_predictions):
-        #todo: do i need to revert it at the end? probably not because the training data is already processed and
-        # data collator doesn't tokenize new data
-
-        tokenizer.padding_side = 'left'
-
-        inputs = eval_predictions.inputs
-        labels = eval_predictions.label_ids
-
-        labels = np.where(labels == -100, tokenizer.pad_token_id, labels)
-        inputs = np.where(inputs == -100, tokenizer.pad_token_id, inputs)
-
-        # separate the instruction and response
-        input_txts = tokenizer.batch_decode(inputs, skip_special_tokens=False)
-
-        # manually handle the prompt split for llama3
-        prompt_split_text = "<|start_header_id|>assistant<|end_header_id|>"
-        instructions = [txt.split(prompt_split_text)[0].strip() for txt in input_txts]
-        instructions = [i+f"{prompt_split_text}\n\n" for i in instructions]
-
-        inputs = tokenizer(instructions, return_tensors="pt", padding='longest', truncation=False,
-                           add_special_tokens=False)
-        inputs['input_ids'] = inputs['input_ids'].to(model.device)
-        inputs['attention_mask'] = inputs['attention_mask'].to(model.device)
-        input_lens = inputs["input_ids"].shape[1]
-
-        print("Generating responses")
-        decoded_preds = []
-        i = 0
-        batch_size = training_args.per_device_eval_batch_size
-        while i < len(inputs["input_ids"]):
-            input_id_list = inputs["input_ids"][i:i + batch_size]
-            attention_mask_list = inputs["attention_mask"][i:i + batch_size]
-
-            input_id_list = input_id_list.to(model.device)
-            attention_mask_list = attention_mask_list.to(model.device)
-
-
-            terminators = [
-                tokenizer.eos_token_id,
-                tokenizer.convert_tokens_to_ids("<|eot_id|>")
-            ]
-
-            output = model.generate(
-                input_id_list,
-                attention_mask=attention_mask_list,
-                max_new_tokens=script_args.max_new_tokens,
-                eos_token_id=terminators,
-                do_sample=script_args.eval_do_sample,
-                temperature=script_args.eval_temperature,
-                top_p=script_args.eval_top_p,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-
-            decoded_preds.extend(tokenizer.batch_decode(output[:, input_lens:].cpu().numpy(), skip_special_tokens=True))
-            i += batch_size
-
-        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-        for pred, label in zip(decoded_preds, decoded_labels):
-            print(f"Pred: {pred}")
-            print("*"*100)
-            print(f"Label: {label}")
-            print("-"*100)
-
-        # Some simple post-processing
-        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
-
-        result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
-        result = {k: round(v * 100, 4) for k, v in result.items()}
-        prediction_lens = [len(pred) for pred in decoded_preds]
-        result["gen_len"] = np.mean(prediction_lens)
-
-        return result
-
-
     ################
     # Training
     ################
+    #todo: default trainer takes max seq len and tokenize itself before data collation. check seq lens
     trainer = SFTTrainer(
         model=model,
         args=training_args,
-        data_collator=data_collator,
         train_dataset=train_dataset,
         eval_dataset=dev_datasets,
         peft_config=peft_config,
         tokenizer=tokenizer,
-        compute_metrics=compute_metrics,
-        max_seq_length=4096,
+        max_seq_length=training_args.max_seq_length,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=10)],
-        packing=False,
+        packing=True,
     )
+
     if trainer.accelerator.is_main_process and script_args.use_peft:
         trainer.model.print_trainable_parameters()
 
@@ -418,6 +268,8 @@ if __name__ == "__main__":
     parser = TrlParser((ScriptArguments, SFTConfig))
     script_args, training_args = parser.parse_args_and_config()
 
+    print("training_args: ", training_args)
+    print("script_args: ", script_args)
     # set use reentrant to False
     if training_args.gradient_checkpointing:
         training_args.gradient_checkpointing_kwargs = {"use_reentrant": True}
