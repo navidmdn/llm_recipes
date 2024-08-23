@@ -2,19 +2,12 @@ from fire import Fire
 import numpy as np
 from fire import Fire
 import os
-import json
-from typing import List, Dict
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from langchain_core.runnables import Runnable
 from langchain_core.output_parsers import StrOutputParser
-from langchain_aws import ChatBedrock
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-import glob
-from tqdm import tqdm
-from langchain_chroma import Chroma
-from langchain_core.example_selectors import SemanticSimilarityExampleSelector
-# from utils import load_hf_embedding_model
-from langchain_openai import ChatOpenAI
+from utils.langchain import load_hf_auto_regressive_model
+# from langchain_openai import ChatOpenAI
 
 def simulate(persona1: str, persona2: str, scenario: str, llm: Runnable, n_turns: int) -> None:
     """
@@ -30,12 +23,12 @@ def simulate(persona1: str, persona2: str, scenario: str, llm: Runnable, n_turns
     person1_history = []
     person2_history = []
 
-    person1_sys_msg = SystemMessage(content=f"Your persona: {persona1}\n\nScenario: {scenario}")
-    person2_sys_msg = SystemMessage(content=f"Your persona: {persona2}\n\nScenario: {scenario}")
+    person1_sys_msg = SystemMessage(content=f"{persona1}")
+    person2_sys_msg = SystemMessage(content=f"{persona2}")
 
     cur_speaker = np.random.choice([1, 2])
 
-    last_question = "What are your key arguments for this approach, and how do you envision it leading to a better future for Iran?"
+    last_question = "Hey! how's it going?"
     print(f"speaker {3-cur_speaker}: {last_question}")
 
     for _ in range(n_turns):
@@ -69,21 +62,10 @@ def simulate(persona1: str, persona2: str, scenario: str, llm: Runnable, n_turns
 
 
 
-
 def run(persona1_file: str = 'p1-test.txt', persona2_file: str = 'p2-test.txt', scenario_file: str = 'scenario-test.txt',
-        n_iters: int = 1, llm_name: str = 'gpt-4o') -> None:
+        n_iters: int = 1, llm_name: str = 'gpt-4o', temperature=0.1, max_new_tokens=4096, hf=False, load_in_4bit=False,
+        cache_dir=None) -> None:
 
-    """
-
-    Simulate some conversations between two speakers based on their personas and a scenario and collects the conversation.
-
-    :param llm_name:
-    :param n_iters: number of iterations
-    :param persona1_file: path to the first speaker's persona file
-    :param persona2_file: path to the second speaker's persona file
-    :param scenario_file: path to the scenario file
-    :return:
-    """
 
     with open(persona1_file, 'r') as f:
         persona1 = f.read().strip()
@@ -91,14 +73,19 @@ def run(persona1_file: str = 'p1-test.txt', persona2_file: str = 'p2-test.txt', 
     with open(persona2_file, 'r') as f:
         persona2 = f.read().strip()
 
-    with open(scenario_file, 'r') as f:
-        scenario = f.read().strip()
+    # with open(scenario_file, 'r') as f:
+    #     scenario = f.read().strip()
+    scenario = ""
 
     if 'llama' in llm_name or 'mistral' in llm_name:
-        pass
+        if hf:
+            llm = load_hf_auto_regressive_model(llm_name, max_new_tokens=max_new_tokens, load_in_4bit=load_in_4bit,
+                                                cache_dir=cache_dir)
+        else:
+            raise ValueError("LLM not implemented")
     elif 'gpt' in llm_name:
         llm = ChatOpenAI(model_name=llm_name, openai_api_key=OPENAI_API_KEY, openai_api_base=OPENAI_API_BASE,
-                        max_tokens=4096, temperature=0.7,)
+                        max_tokens=max_new_tokens, temperature=temperature,)
     else:
         raise ValueError("LLM not implemented")
 
