@@ -17,7 +17,7 @@ def generate_resp(model, tokenizer, examples, device, temperature=0.1, top_p=0.9
 
     prompts = [[
         {"role": "system", "content": "todo system message"},
-        {"role": "user", "content": ex['query']},
+        *ex['messages'],
     ] for ex in examples]
 
     input_chat_prompts = [tokenizer.apply_chat_template(
